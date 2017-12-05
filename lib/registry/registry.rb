@@ -1,6 +1,7 @@
 require 'fileutils'
 require 'rest-client'
 require 'json'
+require 'base64'
 
 class DockerRegistry2::Registry
   # @param [#to_s] base_uri Docker registry base URI
@@ -45,10 +46,31 @@ class DockerRegistry2::Registry
     return repos
   end
 
+  def next_link (headers,path)
+    return if headers.nil?
+    return if headers[:link].nil?
+    headers[:link].sub(/.*#{path}/,'').split(">")[0]
+  end
+
   def tags(repo,withHashes = false)
-    response = doget "/v2/#{repo}/tags/list"
-    # parse the response
-    resp = JSON.parse response
+    url  = "/v2/#{repo}/tags/list"
+    next_repo = ""
+    tags = []
+    resp = nil
+    loop do
+      response  = doget "#{url}#{next_repo}"
+      next_repo = next_link response.headers, url
+      resp = JSON.parse response
+      tags += JSON.parse(response)["tags"]
+
+      puts tags.size
+      # parse the response
+      if next_repo.nil?
+        resp["tags"] = tags
+        break
+      end
+      resp = JSON.parse response
+    end
     # do we include the hashes?
     if withHashes then
       useGet = false
@@ -166,6 +188,16 @@ class DockerRegistry2::Registry
   end
 
   private
+    def _token_for url
+      url.query = nil
+      @_token_for ||= {}
+      @_token_for[url.to_s]
+    end
+    def _safe_token_for url, header
+      url.query = nil
+      @_token_for ||= {}
+      @_token_for[url.to_s] = header
+    end
     def doreq(type,url,stream=nil)
       begin
         block = stream.nil? ? nil : proc { |response|
@@ -173,10 +205,13 @@ class DockerRegistry2::Registry
             stream.write chunk
           end
         }
+        headers = {Accept: 'application/vnd.docker.distribution.manifest.v2+json'}
+        authorization = _token_for URI (@base_uri+url)
+        headers[:Authorization] = authorization if authorization
         response = RestClient::Request.execute(
           method: type,
           url: @base_uri+url,
-          headers: {Accept: 'application/vnd.docker.distribution.manifest.v2+json'},
+          headers: headers,
           block_response: block,
           open_timeout: @open_timeout,
           read_timeout: @read_timeout
@@ -199,6 +234,7 @@ class DockerRegistry2::Registry
     end
 
     def do_basic_req(type, url, stream=nil)
+      _safe_token_for(URI(@base_uri+url),'Basic '+ Base64.strict_encode64([@user,@password].join(":")))
       begin
         block = stream.nil? ? nil : proc { |response|
           response.read_body do |chunk|
@@ -227,6 +263,7 @@ class DockerRegistry2::Registry
 
     def do_bearer_req(type, url, header, stream=false)
       token = authenticate_bearer(header)
+      _safe_token_for(URI(@base_uri+url),'Bearer '+token)
       begin
         block = stream.nil? ? nil : proc { |response|
           response.read_body do |chunk|
